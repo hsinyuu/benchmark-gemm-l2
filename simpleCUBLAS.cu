@@ -27,11 +27,11 @@ inline void cublasAssert(cublasStatus_t status, const char *file, int line, bool
 }
 
 void flush_l2(cudaStream_t stream) {
-  printf("Flushing L2\n");
   int dev_id = 0;
   int l2_size = 0;
   CUDA_SAFE_CALL(cudaGetDevice(&dev_id));
   CUDA_SAFE_CALL(cudaDeviceGetAttribute(&l2_size, cudaDevAttrL2CacheSize, dev_id));
+  printf("Flushing device %d L2 %d bytes\n", dev_id, l2_size);
   void *buffer = 0;
   CUDA_SAFE_CALL(cudaMalloc(&buffer, l2_size));
   CUDA_SAFE_CALL(cudaMemsetAsync(buffer, 0, l2_size, stream));
@@ -60,16 +60,16 @@ static void simple_sgemm(int n, float alpha, const float *A, const float *B,
 #endif
 
 # define L2_LINE_SIZE 128
-__global__ void prefetch_l2(uint8_t* ptr, size_t num_bytes) {
+__global__ void prefetch_l2(void *ptr, size_t num_bytes) {
   for (size_t i = 0; i < num_bytes; i+=L2_LINE_SIZE) {
-    asm volatile ("prefetch.global.L2::evict_last [%0];" ::"l"(ptr + i) :);
+    asm volatile ("prefetch.global.L2::evict_last [%0];" ::"l"((uint8_t*)ptr + i) :);
   }
 }
 
 
-#define M (2048)
+#define M (1024)
 #define K (2048)
-#define N (2048)
+#define N (1024)
 #define MxK M*K
 #define KxN K*N
 #define MxN M*N
@@ -96,13 +96,16 @@ int main(int argc, char **argv) {
   cublasHandle_t handle;
 
   /* Initialize CUBLAS */
+  size_t inp_mb = sizeof(host_inp[0])*MxK/1024/1024;
+  size_t wgt_mb = sizeof(host_wgt[0])*KxN/1024/1024;
+  size_t outp_mb = sizeof(host_outp[0])*MxN/1024/1024;
   printf("simpleCUBLAS test running..\n");
   printf("Gemm [%d,%d] x [%d,%d] -> [%d,%d]\n", M,K, K,N, M,N);
-  printf("Input Bytes %zuMB\n", sizeof(host_inp[0])*MxK/1024/1024);
-  printf("Weight Bytes %zuMB\n", sizeof(host_wgt[0])*KxN/1024/1024);
-  printf("Output Bytes %zuMB\n", sizeof(host_outp[0])*MxN/1024/1024);
-  printf("Total Input Bytes: %zuMB\n", (sizeof(host_inp[0])*MxK + sizeof(host_wgt[0])*KxN)/1024/1024);
-  printf("Total Output Bytes: %zuMB\n", sizeof(host_outp[0])*MxN/1024/1024);
+  printf("Input Bytes %zuMB\n", inp_mb);
+  printf("Weight Bytes %zuMB\n", wgt_mb); 
+  printf("Output Bytes %zuMB\n", outp_mb);
+  printf("Total Input Bytes: %zuMB\n", inp_mb + wgt_mb);
+  printf("Total Device Bytes: %zuMB\n", inp_mb + wgt_mb + outp_mb);
 
   CUBLAS_SAFE_CALL(cublasCreate(&handle));
 
@@ -128,9 +131,21 @@ int main(int argc, char **argv) {
   }
 
   /* Allocate device memory for the matrices */
+  float *base_addr = device_inp;
   CUDA_SAFE_CALL(cudaMalloc(reinterpret_cast<void **>(&device_inp), MxK * sizeof(device_inp[0])))
   CUDA_SAFE_CALL(cudaMalloc(reinterpret_cast<void **>(&device_wgt), KxN * sizeof(device_wgt[0])))
   CUDA_SAFE_CALL(cudaMalloc(reinterpret_cast<void **>(&device_outp), MxN * sizeof(device_outp[0])))
+  printf("Device Pointers: inp=%p, wgt=%p, outp=%p\n", device_inp, device_wgt, device_outp);
+  
+  /* Verify allocations are contiguous */
+  if (!((size_t)device_inp + inp_mb*1024*1024 == (size_t)device_wgt)) {
+    printf("Device allocated memory is not contiguous\n");
+		return EXIT_FAILURE;
+  }
+  if (!((size_t)device_wgt + wgt_mb*1024*1024 == (size_t)device_outp)) {
+    printf("Device allocated memory is not contiguous\n");
+		return EXIT_FAILURE;
+  }
 
   /* Initialize the device matrices with the host matrices */
   CUBLAS_SAFE_CALL(cublasSetVector(MxK, sizeof(host_inp[0]), host_inp, 1, device_inp, 1));
@@ -153,7 +168,7 @@ int main(int argc, char **argv) {
 
     // Set persistent memory size
     size_t window_size = std::min<size_t>(prop.accessPolicyMaxWindowSize, alloc_num_bytes);
-    stream_attribute.accessPolicyWindow.base_ptr  = reinterpret_cast<void*>(device_inp);
+    stream_attribute.accessPolicyWindow.base_ptr  = reinterpret_cast<void*>(base_addr);
     stream_attribute.accessPolicyWindow.num_bytes = window_size;
     stream_attribute.accessPolicyWindow.hitRatio  = 1.0;
     stream_attribute.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
@@ -172,10 +187,9 @@ int main(int argc, char **argv) {
   host_outp_ref = host_outp;
 #endif
 
-
-  flush_l2(stream);
   /* Performs operation using cublas */
-  printf("Run Cublas Gemm\n");
+  printf("Warmup\n");
+  flush_l2(stream);
   CUBLAS_SAFE_CALL(
       cublasSgemm(
         handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha, 
@@ -185,6 +199,7 @@ int main(int argc, char **argv) {
         device_outp, N
   ));
 
+	printf("Test flush\n");
   flush_l2(stream);
   CUBLAS_SAFE_CALL(
       cublasSgemm(
@@ -211,7 +226,6 @@ int main(int argc, char **argv) {
         &beta, 
         device_outp, N
   ));
-  flush_l2(stream);
   CUBLAS_SAFE_CALL(
       cublasSgemm(
         handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha, 
@@ -220,15 +234,11 @@ int main(int argc, char **argv) {
         &beta, 
         device_outp, N
   ));
+
+
+  printf("Test prefetch kernel\n");
   flush_l2(stream);
-  CUBLAS_SAFE_CALL(
-      cublasSgemm(
-        handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha, 
-        device_inp, N, 
-        device_wgt, N, 
-        &beta, 
-        device_outp, N
-  ));
+	prefetch_l2<<<1,1>>>(base_addr, inp_mb*1024*1024+wgt_mb*1024*1024);
   CUBLAS_SAFE_CALL(
       cublasSgemm(
         handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha, 
